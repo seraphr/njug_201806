@@ -1,17 +1,28 @@
 <!doctype html>
-<html>
+<html lang="ja">
 	<head>
 		<meta charset="utf-8">
 		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 
-		<title>reveal.js</title>
+		<title>リソースを確実にCloseする話</title>
 
 		<link rel="stylesheet" href="css/reveal.css">
 		<link rel="stylesheet" href="css/theme/black.css">
+		<style type="text/css">
+		  .reveal h1,
+		  .reveal h2,
+		  .reveal h3,
+		  .reveal h4,
+		  .reveal h5,
+		  .reveal h6 {
+		    text-transform: none;
+		  }
+		</style>
 
 		<!-- Theme used for syntax highlighting of code -->
 		<link rel="stylesheet" href="lib/css/zenburn.css">
 
+		
 		<!-- Printing and PDF exports -->
 		<script>
 			var link = document.createElement( 'link' );
@@ -24,8 +35,556 @@
 	<body>
 		<div class="reveal">
 			<div class="slides">
-				<section>Slide 1</section>
-				<section>Slide 2</section>
+
+				<section data-markdown data-separator=">>>" data-separator-vertical="---">
+					<script type="text/template">
+## リソースを確実にCloseする話
+
+@seraphr  
+NJUG  
+2018/06/23
+
+>>>
+
+## 自己紹介
+
+* 来栖川電算
+* Scala
+* twitter: @seraphr
+
+>>>
+
+## 内容
+
+---
+
+### 目的
+
+* イベントストリーム・非同期処理という場面以外でのRxJavaの使用例の紹介<!-- .element: class="fragment" data-fragment-index="1" -->
+
+---
+
+### 今日する話
+
+* try-with-resources（だけ）では解決できない問題<!-- .element: class="fragment" data-fragment-index="1" -->
+* コールバック関数による解決方法とその問題点<!-- .element: class="fragment" data-fragment-index="2" -->
+* RxJavaを用いた解決方法<!-- .element: class="fragment" data-fragment-index="3" -->
+
+---
+
+### 今日しない話
+
+* RxJavaの詳細の説明<!-- .element: class="fragment" data-fragment-index="1" -->
+    * Flowable / Observable<!-- .element: class="fragment" data-fragment-index="2" -->
+    * Hot / Cold<!-- .element: class="fragment" data-fragment-index="3" -->
+    * backpressure<!-- .element: class="fragment" data-fragment-index="4" -->
+
+
+>>>
+
+## 環境
+
+* Java 8
+* Scala 2.12.6
+* RxJava 2.1.14
+
+>>>
+
+## try-with-resouces
+
+---
+
+### try-with-resouces
+
+* close忘れを防いでくれる  
+* 便利
+
+```java
+try(InputStream in = new FileInputStream("in")){
+  // なにかする
+}
+```
+<!-- .element: class="fragment" data-fragment-index="1" -->
+
+* scala なら （単純な）LoanPattern<!-- .element: class="fragment" data-fragment-index="2" -->
+
+```scala
+Loan(new FileInputStream("in")) { in =>
+  // なにかする
+}
+```
+<!-- .element: class="fragment" data-fragment-index="2" -->
+
+---
+
+### 制約
+
+* openとcloseが一つのメソッド内に収まっていること<!-- .element: class="fragment" data-fragment-index="1" -->
+* ブロック内の処理が同期的であること<!-- .element: class="fragment" data-fragment-index="2" -->
+
+>>>
+
+## 問題設定
+
+---
+
+* データ列の供給者と消費者が居る <!-- .element: class="fragment" data-fragment-index="1" -->
+* 供給者<!-- .element: class="fragment" data-fragment-index="2" -->
+    * データ列はIteratorのようなもの<!-- .element: class="fragment" data-fragment-index="2" -->
+    * ファイル（closeが必要なデータソース）からデータを読むかもしれない<!-- .element: class="fragment" data-fragment-index="2" -->
+* 消費者<!-- .element: class="fragment" data-fragment-index="3" -->
+    * データ列を最後まで処理しないかもしれない<!-- .element: class="fragment" data-fragment-index="3" -->
+
+* 必要であれば確実にcloseを行いたい<!-- .element: class="fragment" data-fragment-index="4" -->
+    * データの利用者にcloseの責務を負わせたくない<!-- .element: class="fragment" data-fragment-index="4" -->
+
+---
+
+例
+
+```scala
+trait Provider[A] {
+  def provide(): Iterator[A]
+}
+
+trait Consumer[A] {
+  def consume(itr: Iterator[A]): Unit
+}
+```
+
+```scala
+object Runner {
+  def runMap[A, B](p: Provider[A], f: A => B, c: Consumer[B]): Unit =
+    c.consume(
+      p.provide().map(f)
+    )
+
+  def runTake(p: Provider[A], i: Int, c: Consumer[B]): Unit =
+    c.consume(
+      p.provide().take(i)
+    )
+}
+```
+<!-- .element: class="fragment" data-fragment-index="1" -->
+
+---
+
+* インターフェース的にcloseをする手段がない<!-- .element: class="fragment" data-fragment-index="1" -->
+    * あったとしても、ユーザにcloseの責務を負わせたくない<!-- .element: class="fragment" data-fragment-index="1" -->
+* Iteratorの終端に達したときにclose<!-- .element: class="fragment" data-fragment-index="2" -->
+    * 最後まで読まれるとは限らない<!-- .element: class="fragment" data-fragment-index="2" -->
+    * 例外などで処理が飛ぶかもしれない<!-- .element: class="fragment" data-fragment-index="2" -->
+
+>>>
+
+## 解法 - Callback
+
+---
+
+APIをコールバックを用いた形に書き換える
+
+```scala
+trait Provider[A] {
+  def provide(f: Iterator[A] => Unit): Unit
+}
+
+trait Consumer[A] {
+  def consume(itr: Iterator[A]): Unit
+}
+```
+
+```scala
+object Runner {
+  def runMap[A, B](p: Provider[A], f: A => B, c: Consumer[B]): Unit =
+    p.provide { itr =>
+      c.consume(itr.map(f))
+    }
+
+  def runTake[A](p: Provider[A], i: Int, c: Consumer[A]): Unit =
+    p.provide { itr =>
+      c.consume(itr.take(i))
+    }
+}
+```
+<!-- .element: class="fragment" data-fragment-index="1" -->
+
+---
+
+ファイルのOpen / Closeを  
+一つのメソッドの中に収められるようになった
+
+```scala
+class FileLinesProvider(file: Path) extends Provider[String] {
+  override def provide(f: Iterator[String] => Unit): Unit = {
+    Loan(Files.newBufferedReader(file, StandardCharsets.UTF_8)) { in =>
+      val itr = Iterator.continually(in.readLine).takeWhile(_ != null)
+      f(itr)
+    }
+  }
+}
+```
+
+>>>
+
+## Callbackの問題点
+
+---
+
+* 容易にインデントが深くなる
+* 型シグネチャが複雑になる
+
+---
+
+少し複雑な例
+
+* (Consumer[Int] => Unit) => Unit<!-- .element: class="fragment" data-fragment-index="1" -->  
+
+```scala
+object Runner {
+  def runComplex(p: Provider[String],
+                 pp: String => Provider[String],
+                 f: String => Int,
+                 cp: (Consumer[Int] => Unit) => Unit): Unit = {
+    cp { consumer =>
+      p.provide { itr =>
+        itr.foreach { str =>
+          pp(str).provide { itr2 =>
+            consumer.consume(itr2.map(f))
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+
+---
+
+```scala
+object RunComplex extends App {
+  def createProvider(aStr: String): Provider[String] =
+    f => f(aStr.tails)
+
+  val consumer: Consumer[Int] =
+    itr => itr.foreach(i => print(s"${i}, "))
+
+  Runner.runComplex(
+    createProvider("aaaa"),
+    s => createProvider(s),
+    s => s.length,
+    f => {
+      println("start consume")
+      f(consumer)
+      println; println("end consume")
+    }
+  )
+}
+```
+
+```
+start consume
+4, 3, 2, 1, 0, 3, 2, 1, 0, 2, 1, 0, 1, 0, 0, 
+end consume
+```
+
+>>>
+
+## RxJava
+
+---
+
+* よくある紹介
+    * (コレクション処理)
+    * 高度なObserver パターン
+    * GUIアプリのイベント（の組み合わせ）の処理
+    * 非同期通信などの処理
+
+=> コールバックの抽象化<!-- .element: class="fragment" data-fragment-index="1" style="text-align: left;" -->  
+=> 当然、同期処理のコールバックも取り扱える<!-- .element: class="fragment" data-fragment-index="1" style="text-align: left;" -->
+
+---
+
+## Cold Observable
+
+* コールバックが登録される(subscribe)されると、すべてのデータを先頭から送ってくるデータの出口<!-- .element: style="font-size: 0.7em;" -->
+* 今回出てくるObservableは全てこれ<!-- .element: style="font-size: 0.7em;" -->
+
+```scala
+import io.reactivex.Observable
+
+object ColdObservable extends App {
+  val obs = Observable.create[String] { tEmitter =>
+    println("start")
+    tEmitter.onNext("hoge")
+    tEmitter.onNext("fuga")
+    tEmitter.onComplete()
+    println("end")
+  }
+
+  obs.subscribe(s => println(s))
+  println()
+  obs.subscribe(s => println(s))
+}
+```
+<!-- .element: class="fragment" data-fragment-index="1" -->
+
+---
+
+2回subscribeすると
+
+```scala
+  obs.subscribe(s => println(s))
+  println()
+  obs.subscribe(s => println(s))
+```
+
+2回スタートして、2回終了する<!-- .element: class="fragment" data-fragment-index="1" -->
+
+```
+start
+hoge
+fuga
+end
+
+start
+hoge
+fuga
+end
+```
+<!-- .element: class="fragment" data-fragment-index="1" -->
+
+---
+
+mapで、値を変換できる
+
+```scala
+object ColdObservable2 extends App {
+  val obs = Observable.fromArray(1,2,3).map(i => i * 2)
+  obs.subscribe(i => println(i))
+}
+```
+
+```
+2
+4
+6
+```
+<!-- .element: class="fragment" data-fragment-index="1" -->
+
+---
+
+flatMapで、複数のObservableを結合できる
+
+```scala
+object ColdObservable3 extends App {
+  def createObs(i: Int): Observable[Int] = Observable.fromArray(i, i + 1)
+
+  val obs = Observable.fromArray(1,2,3).flatMap(i => createObs(i))
+  obs.subscribe(i => println(i))
+}
+```
+
+```
+1
+2
+2
+3
+3
+4
+```
+<!-- .element: class="fragment" data-fragment-index="1" -->
+
+---
+
+takeで、先頭の要素を取り出すことができる
+
+```scala
+object ColdObservable4 extends App {
+  val obs = Observable.fromArray(1,2,3,4,5,6,7,8).take(5)
+  obs.subscribe(i => println(i))
+}
+```
+
+```
+1
+2
+3
+4
+5
+```
+<!-- .element: class="fragment" data-fragment-index="1" -->
+
+>>>
+
+## 解法 - RxJava
+
+---
+
+Iteratorの代わりにObservableを使うようにする
+
+```scala
+import io.reactivex.Observable
+
+trait Provider[A] {
+  def provide(): Observable[A]
+}
+
+trait Consumer[A] {
+  def consume(itr: Observable[A]): Unit
+}
+```
+
+```scala
+import io.reactivex.Observable
+
+object Runner {
+  def runMap[A, B](p: Provider[A], f: A => B, c: Consumer[B]): Unit = {
+    c.consume(p.provide().map(a => f(a)))
+  }
+
+  def runTake[A](p: Provider[A], i: Int, c: Consumer[A]): Unit = {
+    c.consume(p.provide().take(i))
+  }
+}
+```
+<!-- .element: class="fragment" data-fragment-index="1" -->
+
+---
+
+ファイルのOpen / Closeを  
+一つのメソッドの中に収められるようになった
+
+```scala
+class FileLinesProvider(file: Path) extends Provider[String] {
+  // 本来必要なエラー処理は飛ばしている
+  override def provide(): Observable[String] = Observable.create[String] {
+    tEmitter => {
+      Loan(Files.newBufferedReader(file, StandardCharsets.UTF_8)) { in =>
+        val itr = Iterator.continually(in.readLine).takeWhile(_ != null)
+        itr.foreach { s => tEmitter.onNext(s) }
+        tEmitter.onComplete()
+      }
+    }
+  }
+}
+```
+
+---
+
+複雑な例もインデントが深くならない  
+Consumerをコールバックにする必要もない
+
+```scala
+object Runner {
+  def runComplex(p: Provider[String],
+                 pp: String => Provider[String],
+                 f: String => Int,
+                 c: Consumer[Int]): Unit = {
+
+    val obs: Observable[Int] =
+      p.provide()
+        .flatMap(s => pp(s).provide())
+        .map(s => f(s))
+    c.consume(obs)
+  }
+}
+```
+
+---
+
+使う部分は殆ど変わらない
+
+```scala
+object RunComplex extends App {
+  def createProvider(aStr: String): Provider[String] =
+    () => Observable.fromArray(aStr.tails.toArray: _*)
+
+  val consumer: Consumer[Int] = {
+    itr =>
+      println("start consume")
+      itr.subscribe(i => print(s"${i}, "))
+      println
+      println("end consume")
+  }
+
+  Runner.runComplex(
+    createProvider("aaaa"),
+    s => createProvider(s),
+    s => s.length,
+    consumer
+  )
+}
+```
+
+```
+start consume
+4, 3, 2, 1, 0, 3, 2, 1, 0, 2, 1, 0, 1, 0, 0, 
+end consume
+```
+
+---
+
+* Callbackの例もRxJavaの例も、リソースのOpenとCloseの方法を、オブジェクトとして持ち運んでいる
+* RxJavaは、そのコンビネータにより見かけ上の複雑さを隠蔽できる
+
+>>>
+
+## 余談
+
+---
+
+### RxJavaである必要はあるか？
+
+
+* あまり無い<!-- .element: class="fragment" data-fragment-index="1" -->
+    * 確実なリソースのCloseのためだけに利用するにはオーバースペック<!-- .element: class="fragment" data-fragment-index="1" -->
+    * コールバックの例を拡張することでも対応可能<!-- .element: class="fragment" data-fragment-index="1" -->
+* RxJavaは以下のような要素の組み合わせを取り扱う<!-- .element: class="fragment" data-fragment-index="2" -->
+    * 非同期<!-- .element: class="fragment" data-fragment-index="2" -->
+    * コールバック<!-- .element: class="fragment" data-fragment-index="2" -->
+    * 失敗<!-- .element: class="fragment" data-fragment-index="2" -->
+    * 無限ストリーム<!-- .element: class="fragment" data-fragment-index="2" -->
+* 逆にいうと、上記の要素と無理なく組み合わせられる<!-- .element: class="fragment" data-fragment-index="3" -->
+
+---
+
+### その他のキーワード
+
+* 限定継続・継続モナド<!-- .element: class="fragment" data-fragment-index="1" -->
+* C# yield / python yield<!-- .element: class="fragment" data-fragment-index="2" -->
+* (Completable)Future / Promise<!-- .element: class="fragment" data-fragment-index="3" -->
+
+---
+
+## Observable(Flowable) 注意
+
+* 内部イテレータ<!-- .element: class="fragment" data-fragment-index="1" -->
+    * 処理の中断・再開が通常できない<!-- .element: class="fragment" data-fragment-index="2" -->
+    * 2つのイテレータの要素を順番に処理していくのが難しい<!-- .element: class="fragment" data-fragment-index="3" -->
+        * zip とか<!-- .element: class="fragment" data-fragment-index="3" -->
+        * スレッド・継続が必要<!-- .element: class="fragment" data-fragment-index="3" -->
+* 非同期<!-- .element: class="fragment" data-fragment-index="4" -->
+    * Observableのコンビネータは非同期に実行される可能性がある<!-- .element: class="fragment" data-fragment-index="5" -->
+    * 同期だと思っていると予想外の動作をする<!-- .element: class="fragment" data-fragment-index="5" -->
+
+>>>
+
+## まとめ
+
+* データ生成部を抽象化すると try-with-resources では解決できない問題が生まれる<!-- .element: class="fragment" data-fragment-index="1" -->
+* コールバックによる解法は複雑なことをするとつらい<!-- .element: class="fragment" data-fragment-index="2" -->
+* コールバック地獄に対応するのにRxJavaはもちろん使える<!-- .element: class="fragment" data-fragment-index="3" -->
+
+---
+
+## おわり
+
+なにか質問があればどうぞ。
+
+
+					</script>
+				</section>
 			</div>
 		</div>
 
